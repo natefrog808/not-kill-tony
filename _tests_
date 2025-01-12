@@ -1,504 +1,165 @@
-/// <reference types="node" />
-import { process } from 'process';
-import { OpenAI } from 'openai';
-import Redis from 'ioredis';
-import winston from 'winston';
+import { describe, test, expect, beforeEach, jest } from '@jest/globals';
+import { Redis } from 'ioredis';
+import { RoastBot } from '../src/RoastBot';
+import OpenAI from 'openai';
 
-const logger = winston.createLogger({
-    level: 'info',
-    format: winston.format.json(),
-    transports: [
-        new winston.transports.File({ filename: 'error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'combined.log' })
-    ]
-});
+// Mock OpenAI and Redis
+jest.mock('openai');
+jest.mock('ioredis');
 
-if (process.env.NODE_ENV !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: winston.format.simple()
-    }));
-}
+describe('RoastBot', () => {
+    let bot: RoastBot;
+    let mockRedis: jest.Mocked<Redis>;
+    let mockOpenAI: jest.Mocked<OpenAI>;
 
-interface BotState {
-  moodLevel: number;
-  lastResponses: string[];
-  cooldowns: Map<string, number>;
-  conversationHistory: string[];
-}
+    beforeEach(() => {
+        // Clear all mocks
+        jest.clearAllMocks();
 
-interface Memory {
-  shortTerm: string[];
-  longTerm: Map<string, number>;
-  context: string[];
-}
+        // Setup Redis mock
+        mockRedis = new Redis() as jest.Mocked<Redis>;
+        mockRedis.get.mockResolvedValue(null);
+        mockRedis.set.mockResolvedValue('OK');
+        mockRedis.incr.mockResolvedValue(1);
 
-interface PersonalityTrait {
-  name: string;
-  level: number;
-  responses: string[];
-}
+        // Setup OpenAI mock
+        mockOpenAI = new OpenAI({ apiKey: 'fake-key' }) as jest.Mocked<OpenAI>;
+        mockOpenAI.chat.completions.create.mockResolvedValue({
+            choices: [{ message: { content: 'Mocked response' } }]
+        } as any);
 
-interface EnhancedBotState extends BotState {
-  memory: Memory;
-  personality: PersonalityTrait[];
-  learningRate: number;
-  lastInteractionTime: number;
-  commandPrefix: string;
-  debugMode: boolean;
-  openAIConfig: {
-    model: string;
-    maxTokens: number;
-  };
-}
+        bot = new RoastBot('fake-api-key', mockRedis);
+    });
 
-// Add new interfaces for NLP and Response handling
-interface NLPAnalysis {
-    sentiment: number;
-    topics: string[];
-    intent: string;
-    entities: string[];
-}
-
-interface ResponseTemplate {
-    text: string;
-    moodRequirement: number;
-    cooldown: number;
-    topics: string[];
-}
-
-const EXPANDED_PERSONALITY_TRAITS: PersonalityTrait[] = [
-    {
-        name: 'sarcasm',
-        level: 0.8,
-        responses: [
-            "Oh wow, {userName}, that's *totally* genius... 🙄",
-            "Brilliant observation, {userName}. Did you figure that out all by yourself?",
-            "Your code is like a modern art masterpiece, {userName}... nobody understands it.",
-            "Have you considered a career in writing comedy? Because your code is hilarious.",
-        ]
-    },
-    {
-        name: 'wit',
-        level: 0.7,
-        responses: [
-            "I'd explain it to you, {userName}, but I'm all out of crayons.",
-            "Your code is like a mystery novel, {userName}... full of bad practices and plot holes.",
-            "If your code was a movie, {userName}, it would win an award for 'Most Confusing Plot'.",
-            "Ah, {userName}, breaking production with style since {year}!"
-        ]
-    },
-    {
-        name: 'technical',  
-        level: 0.6,
-        responses: [
-            "Your variable naming convention is... unique. Like a fingerprint. A very messy fingerprint.",
-            "I see you're using nested callbacks. Bold choice for 2025, {userName}.",
-            "Ah yes, the classic 'it works on my machine' architecture.",
-            "Your code coverage is so low, it's practically underground."
-        ]
-    }
-];
-
-export class RoastBot {
-    private state: EnhancedBotState = {
-        moodLevel: 0,
-        lastResponses: [],
-        cooldowns: new Map(),
-        conversationHistory: [],
-        memory: {
-            shortTerm: [],
-            longTerm: new Map(),
-            context: []
-        },
-        personality: [
-            {
-                name: 'sarcasm',
-                level: 0.8,
-                responses: [
-                    "Oh wow, {userName}, that's *totally* genius... 🙄",
-                    "Brilliant observation, {userName}. Did you figure that out all by yourself?",
-                ]
-            },
-            {
-                name: 'wit',
-                level: 0.7,
-                responses: [
-                    "I'd explain it to you, {userName}, but I'm all out of crayons.",
-                    "Your code is like a mystery novel, {userName}... full of bad practices and plot holes.",
-                ]
-            }
-        ],
-        learningRate: 0.1,
-        lastInteractionTime: Date.now(),
-        commandPrefix: '!',
-        debugMode: false,
-        openAIConfig: {
-            model: 'gpt-4',
-            maxTokens: 150
-        }
-    };
-
-    private readonly cooldownDuration = 30000; // 30 seconds
-    private readonly maxMoodLevel = 10;
-    private readonly minMoodLevel = -10;
-
-    private openai: OpenAI;
-    private redis: Redis;
-
-    constructor(apiKey: string, redisConfig: {
-        host?: string;
-        port?: number;
-        password?: string;
-        url?: string;
-    } = {}) {
-        this.openai = new OpenAI({ apiKey });
-        
-        // Initialize Redis with fallback values
-        this.redis = new Redis({
-            host: redisConfig.host || 'localhost',
-            port: redisConfig.port || 6379,
-            password: redisConfig.password,
-            url: redisConfig.url,
-            retryStrategy: (times) => {
-                const delay = Math.min(times * 50, 2000);
-                return delay;
-            }
-        });
-
-        // Handle Redis connection events
-        this.redis.on('error', (error) => {
-            console.error('Redis connection error:', error);
-        });
-
-        this.redis.on('connect', () => {
-            console.log('Successfully connected to Redis');
-        });
-    }
-
-    async handleMessage(message: { 
-        content: string, 
-        userId: string, 
-        userName: string,
-        mentions: string[]
-    }): Promise<string | null> {
-        try {
-            // Check cooldown
-            if (this.isUserInCooldown(message.userId)) {
-                return null;
-            }
-
-            // Handle commands
-            if (message.content.startsWith(this.state.commandPrefix)) {
-                return this.handleCommand(message);
-            }
-
-            // Process message with NLP
-            const analysis = await this.analyzeMessage(message.content);
-            
-            // Update bot's mood based on interaction
-            this.updateMood(analysis.sentiment);
-            
-            // Update memory and learning
-            this.updateMemory(message);
-            this.learn(analysis);
-
-            // Generate response
-            const response = this.generateResponse(message, analysis);
-            
-            // Set cooldown
-            this.setCooldown(message.userId);
-
-            return response;
-        } catch (error) {
-            console.error('Error processing message:', error);
-            return "Even I'm confused by that one... 🤔 Try again later!";
-        }
-    }
-
-    private async analyzeMessage(content: string): Promise<NLPAnalysis> {
-        try {
-            // Integration with an NLP service (example using OpenAI - you'd need to implement this)
-            // const analysis = await openai.analyze(content);
-            
-            // Placeholder simple analysis
-            return {
-                sentiment: this.analyzeSentiment(content),
-                topics: this.extractTopics(content),
-                intent: this.detectIntent(content),
-                entities: this.extractEntities(content)
+    describe('Message Handling', () => {
+        test('handles normal messages', async () => {
+            const message = {
+                content: 'Hello bot!',
+                userId: '123',
+                userName: 'TestUser'
             };
-        } catch (error) {
-            console.error('NLP analysis failed:', error);
-            throw error;
-        }
-    }
 
-    private analyzeSentiment(content: string): number {
-        // Simple sentiment analysis (you'd want to use a proper NLP library)
-        const positiveWords = ['good', 'great', 'awesome', 'nice', 'love'];
-        const negativeWords = ['bad', 'terrible', 'hate', 'awful', 'worst'];
-        
-        const words = content.toLowerCase().split(' ');
-        let sentiment = 0;
-        
-        words.forEach(word => {
-            if (positiveWords.includes(word)) sentiment += 0.5;
-            if (negativeWords.includes(word)) sentiment -= 0.5;
+            const response = await bot.handleMessage(message);
+            expect(response).toBeTruthy();
+            expect(mockOpenAI.chat.completions.create).toHaveBeenCalled();
         });
-        
-        return sentiment;
-    }
 
-    private generateResponse(message: { userName: string }, analysis: NLPAnalysis): string {
-        // Select appropriate personality trait based on context
-        const trait = this.selectPersonalityTrait(analysis);
-        
-        // Get response template
-        let response = this.getRandomResponse(trait);
-        
-        // Apply mood modifier
-        response = this.applyMoodModifier(response);
-        
-        // Replace placeholders
-        response = response.replace('{userName}', message.userName);
-        
-        return response;
-    }
+        test('handles empty messages', async () => {
+            const message = {
+                content: '',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    private selectPersonalityTrait(analysis: NLPAnalysis): PersonalityTrait {
-        // Select trait based on context and mood
-        const moodFactor = this.state.moodLevel > 0 ? 'wit' : 'sarcasm';
-        return this.state.personality.find(trait => trait.name === moodFactor) 
-            || this.state.personality[0];
-    }
-
-    private updateMood(sentiment: number): void {
-        this.state.moodLevel = Math.max(
-            this.minMoodLevel,
-            Math.min(
-                this.maxMoodLevel,
-                this.state.moodLevel + sentiment
-            )
-        );
-    }
-
-    private learn(analysis: NLPAnalysis): void {
-        // Update learning based on interaction success
-        this.state.personality.forEach(trait => {
-            if (analysis.topics.some(topic => trait.responses.some(r => r.includes(topic)))) {
-                trait.level += this.state.learningRate;
-            }
+            const response = await bot.handleMessage(message);
+            expect(response).toContain('empty message');
         });
-    }
 
-    private isUserInCooldown(userId: string): boolean {
-        const lastUse = this.state.cooldowns.get(userId);
-        return lastUse ? Date.now() - lastUse < this.cooldownDuration : false;
-    }
+        test('handles long messages', async () => {
+            const message = {
+                content: 'a'.repeat(2000),
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    private setCooldown(userId: string): void {
-        this.state.cooldowns.set(userId, Date.now());
-    }
-
-    private handleCommand(message: { content: string, userName: string }): string {
-        const [command, ...args] = message.content
-            .slice(this.state.commandPrefix.length)
-            .trim()
-            .split(' ');
-
-        switch (command.toLowerCase()) {
-            case 'mood':
-                return `Current mood level: ${this.state.moodLevel}`;
-            case 'stats':
-                return this.getStats(message.userName);
-            default:
-                return "Unknown command. Try !mood or !stats";
-        }
-    }
-
-    private getStats(userName: string): string {
-        const interactions = this.state.memory.longTerm.get(userName) || 0;
-        return `Stats for ${userName}:\nInteractions: ${interactions}\nMood: ${this.state.moodLevel}`;
-    }
-
-    private updateMemory(message: { content: string, userName: string }): void {
-        // Update short-term memory (last 10 messages)
-        this.state.memory.shortTerm.push(message.content);
-        if (this.state.memory.shortTerm.length > 10) {
-            this.state.memory.shortTerm.shift();
-        }
-
-        // Update long-term memory (frequency of interactions)
-        const currentCount = this.state.memory.longTerm.get(message.userName) || 0;
-        this.state.memory.longTerm.set(message.userName, currentCount + 1);
-
-        // Update context
-        this.analyzeContext(message);
-    }
-
-    private analyzeContext(message: { content: string }): void {
-        // Example: Track conversation topics
-        const topics = ['coding', 'debugging', 'testing', 'deployment'];
-        topics.forEach(topic => {
-            if (message.content.toLowerCase().includes(topic)) {
-                this.state.memory.context.push(topic);
-            }
+            const response = await bot.handleMessage(message);
+            expect(response).toContain('too long');
         });
-    }
+    });
 
-    // Add these utility methods
-    private basicAnalysis(content: string): NLPAnalysis {
-        return {
-            sentiment: this.analyzeSentiment(content),
-            topics: this.extractBasicTopics(content),
-            intent: this.detectBasicIntent(content),
-            entities: this.extractBasicEntities(content)
-        };
-    }
+    describe('OpenAI Integration', () => {
+        test('handles OpenAI errors gracefully', async () => {
+            mockOpenAI.chat.completions.create.mockRejectedValueOnce(
+                new Error('OpenAI Error')
+            );
 
-    private calculateResponseEffectiveness(analysis: NLPAnalysis): number {
-        // Calculate based on sentiment, engagement, and context
-        const sentimentImpact = Math.abs(analysis.sentiment) * 0.4;
-        const topicRelevance = analysis.topics.length * 0.3;
-        const intentMatch = 0.3; // Base effectiveness
+            const message = {
+                content: 'Test message',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-        return sentimentImpact + topicRelevance + intentMatch;
-    }
-
-    private pruneIneffectiveResponses(trait: PersonalityTrait): void {
-        // Remove responses that consistently perform poorly
-        trait.responses = trait.responses.filter(response => {
-            const effectiveness = this.getResponseHistory(response);
-            return effectiveness > 0.3; // Minimum effectiveness threshold
+            const response = await bot.handleMessage(message);
+            expect(response).toContain('error');
         });
-    }
 
-    private async generateNewResponses(trait: PersonalityTrait, analysis: NLPAnalysis): Promise<void> {
-        try {
-            // Use OpenAI to generate new contextually relevant responses
-            const prompt = `Generate a witty ${trait.name} response template for a chat bot, 
-                           considering topics: ${analysis.topics.join(', ')}`;
-            
-            const response = await this.openai.chat.completions.create({
-                model: this.state.openAIConfig.model,
-                messages: [{ role: 'user', content: prompt }],
-                max_tokens: 50
-            });
+        test('retries on rate limit', async () => {
+            mockOpenAI.chat.completions.create
+                .mockRejectedValueOnce({ status: 429 })
+                .mockResolvedValueOnce({
+                    choices: [{ message: { content: 'Retry success' } }]
+                } as any);
 
-            const newResponse = response.choices[0].message.content;
-            if (newResponse && !trait.responses.includes(newResponse)) {
-                trait.responses.push(newResponse);
-            }
-        } catch (error) {
-            console.error('Failed to generate new response:', error);
-        }
-    }
+            const message = {
+                content: 'Test message',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    // Add safety features
-    private sanitizeInput(content: string): string {
-        // Remove potentially harmful characters
-        return content.replace(/[<>]/g, '');
-    }
+            const response = await bot.handleMessage(message);
+            expect(mockOpenAI.chat.completions.create).toHaveBeenCalledTimes(2);
+            expect(response).toContain('Retry success');
+        });
+    });
 
-    private async moderateContent(content: string): Promise<boolean> {
-        try {
-            const moderation = await this.openai.moderations.create({
-                input: content
-            });
-            return !moderation.results[0].flagged;
-        } catch (error) {
-            console.error('Moderation failed:', error);
-            return false;
-        }
-    }
+    describe('Redis Integration', () => {
+        test('handles Redis connection errors', async () => {
+            mockRedis.get.mockRejectedValueOnce(new Error('Redis Error'));
 
-    // Add rate limiting
-    private static readonly MAX_REQUESTS_PER_MINUTE = 50;
-    private requestCount = 0;
-    private requestResetTime = Date.now();
+            const message = {
+                content: 'Test message',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    private async checkRateLimit(userId: string): Promise<boolean> {
-        const key = `ratelimit:${userId}`;
-        const limit = 5; // messages per minute
-        const count = await this.incrementCounter(key);
-        
-        if (count === 1) {
-            // Set expiry for first request
-            await this.redis.expire(key, 60);
-        }
-        
-        return count <= limit;
-    }
+            await expect(bot.handleMessage(message)).resolves.toBeTruthy();
+        });
 
-    private extractBasicTopics(content: string): string[] {
-        const topics = ['code', 'bug', 'feature', 'error', 'testing', 'deployment'];
-        return topics.filter(topic => content.toLowerCase().includes(topic));
-    }
+        test('persists conversation history', async () => {
+            const message = {
+                content: 'Test message',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    private detectBasicIntent(content: string): string {
-        if (content.endsWith('?')) return 'question';
-        if (content.endsWith('!')) return 'exclamation';
-        return 'statement';
-    }
+            await bot.handleMessage(message);
+            expect(mockRedis.set).toHaveBeenCalled();
+        });
+    });
 
-    private extractBasicEntities(content: string): string[] {
-        const words = content.split(' ');
-        return words.filter(word => word.match(/^[A-Z][a-z]+/));
-    }
+    describe('Rate Limiting', () => {
+        test('enforces per-user rate limits', async () => {
+            const message = {
+                content: 'Test message',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    private getRandomResponse(trait: PersonalityTrait): string {
-        const index = Math.floor(Math.random() * trait.responses.length);
-        return trait.responses[index];
-    }
+            mockRedis.incr.mockResolvedValueOnce(6); // Over limit
 
-    private extractTopics(content: string): string[] {
-        const topics = ['code', 'bug', 'feature', 'error', 'testing', 'deployment'];
-        return topics.filter(topic => content.toLowerCase().includes(topic));
-    }
+            const response = await bot.handleMessage(message);
+            expect(response).toContain('wait');
+        });
 
-    private detectIntent(content: string): string {
-        if (content.endsWith('?')) return 'question';
-        if (content.endsWith('!')) return 'exclamation';
-        return 'statement';
-    }
+        test('resets rate limits after timeout', async () => {
+            const message = {
+                content: 'Test message',
+                userId: '123',
+                userName: 'TestUser'
+            };
 
-    private extractEntities(content: string): string[] {
-        const words = content.split(' ');
-        return words.filter(word => word.match(/^[A-Z][a-z]+/));
-    }
+            mockRedis.incr
+                .mockResolvedValueOnce(6) // First call over limit
+                .mockResolvedValueOnce(1); // Reset after timeout
 
-    private getResponseHistory(response: string): number {
-        // Simple implementation - could be enhanced with actual response tracking
-        return this.state.personality.find(
-            trait => trait.responses.includes(response)
-        )?.level || 0;
-    }
+            const firstResponse = await bot.handleMessage(message);
+            expect(firstResponse).toContain('wait');
 
-    private applyMoodModifier(response: string): string {
-        if (this.state.moodLevel > 5) {
-            return response + " 😄";
-        } else if (this.state.moodLevel < -5) {
-            return response + " 😠";
-        }
-        return response;
-    }
+            // Simulate timeout
+            jest.advanceTimersByTime(60000);
 
-    // Add cleanup method
-    async disconnect(): Promise<void> {
-        await this.redis.quit();
-    }
-
-    private async incrementCounter(key: string): Promise<number> {
-        try {
-            const count = await this.redis.incr(key);
-            // Set expiry for first request
-            if (count === 1) {
-                await this.redis.expire(key, 60);
-            }
-            return count;
-        } catch (error) {
-            logger.error('Redis increment error:', error);
-            return 0;
-        }
-    }
-}
+            const secondResponse = await bot.handleMessage(message);
+            expect(secondResponse).not.toContain('wait');
+        });
+    });
+}); 
