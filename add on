@@ -1,0 +1,461 @@
+// src/types.ts
+import { z } from 'zod';
+
+export const MessageSchema = z.object({
+    content: z.string().min(1).max(2000),
+    userId: z.string(),
+    userName: z.string(),
+    mentions: z.array(z.string()).optional(),
+    timestamp: z.number().default(() => Date.now())
+});
+
+export type Message = z.infer<typeof MessageSchema>;
+
+export interface UserProfile {
+    userId: string;
+    userName: string;
+    sensitivityLevel: number;
+    pastInteractions: InteractionHistory[];
+    preferredTopics: string[];
+    lastInteraction: number;
+    totalInteractions: number;
+    averageSentiment: number;
+}
+
+export interface InteractionHistory {
+    timestamp: number;
+    sentiment: number;
+    responseType: string;
+    messageContent: string;
+    botResponse: string;
+}
+
+export interface NLPAnalysis {
+    sentiment: number;
+    topics: string[];
+    intent: string;
+    entities: string[];
+    technicalComplexity: number;
+    codeDetected: boolean;
+    languagesDetected: string[];
+    toxicity: number;
+}
+
+export interface BotState {
+    moodLevel: number;
+    lastResponses: string[];
+    cooldowns: Map<string, number>;
+    conversationHistory: string[];
+    personality: PersonalityTrait[];
+    metrics: BotMetrics;
+}
+
+export interface BotMetrics {
+    totalInteractions: number;
+    averageResponseTime: number;
+    userSatisfactionScore: number;
+    mostCommonTopics: Map<string, number>;
+    errorRate: number;
+    activeUsers: Set<string>;
+}
+
+export interface PersonalityTrait {
+    name: string;
+    level: number;
+    responses: string[];
+    conditions?: {
+        minSentiment?: number;
+        maxSentiment?: number;
+        timeOfDay?: number[];
+    };
+}
+
+// src/config.ts
+export const CONFIG = {
+    COOLDOWN_DURATION: 30000,
+    MAX_REQUESTS_PER_MINUTE: 50,
+    REDIS_RETRY_ATTEMPTS: 3,
+    REDIS_RETRY_DELAY: 1000,
+    DEFAULT_OPENAI_MODEL: 'gpt-4',
+    MAX_TOKENS: 150,
+    USER_PROFILE_EXPIRY: 86400 * 30, // 30 days
+    MAINTENANCE_INTERVAL: 3600000, // 1 hour
+    DEFAULT_SENSITIVITY: 0.5,
+    RATE_LIMIT_WINDOW: 60000, // 1 minute
+    MAX_RESPONSE_ATTEMPTS: 3
+};
+
+// src/personality-traits.ts
+export const PERSONALITY_TRAITS: PersonalityTrait[] = [
+    {
+        name: 'sarcastic',
+        level: 0.8,
+        responses: [
+            "Oh wow, {userName}, that code is *just perfect*... if you're trying to crash the server 🙄",
+            "Interesting approach to {topic}... if by interesting you mean completely chaotic",
+            "Have you considered a career in modern art? Because this code is quite abstract"
+        ],
+        conditions: {
+            minSentiment: -0.5,
+            maxSentiment: 0.5
+        }
+    },
+    {
+        name: 'technical',
+        level: 0.7,
+        responses: [
+            "Your {language} implementation could use some design pattern love. Ever heard of {pattern}?",
+            "Let's talk about that O(n^2) complexity. I'm sure the server enjoys taking naps.",
+            "Interesting use of nested callbacks. Have you met our lord and savior, async/await?"
+        ]
+    },
+    {
+        name: 'encouraging',
+        level: 0.6,
+        responses: [
+            "Not bad! But let's make it even better by {improvement}",
+            "You're on the right track with {concept}. Just needs a little tweaking.",
+            "I see what you're trying to do! Here's a pro tip: {tip}"
+        ],
+        conditions: {
+            minSentiment: 0.3
+        }
+    }
+];
+
+// src/roast-bot.ts
+import { OpenAI } from 'openai';
+import { Redis } from 'ioredis';
+import { CONFIG } from './config';
+import { logger } from './logger';
+import {
+    Message,
+    MessageSchema,
+    BotState,
+    NLPAnalysis,
+    UserProfile,
+    PersonalityTrait,
+    BotMetrics
+} from './types';
+import { PERSONALITY_TRAITS } from './personality-traits';
+
+export class RoastBot {
+    private state: BotState;
+    private openai: OpenAI;
+    private redis: Redis;
+    private rateLimits: Map<string, number[]> = new Map();
+    private maintenanceInterval: NodeJS.Timeout;
+
+    constructor(apiKey: string, redisConfig: {
+        host?: string;
+        port?: number;
+        password?: string;
+        url?: string;
+    } = {}) {
+        this.openai = new OpenAI({ apiKey });
+        this.redis = this.initializeRedis(redisConfig);
+        this.state = this.initializeState();
+        this.setupCleanup();
+        this.initializeBackgroundTasks();
+    }
+
+    private initializeRedis(config: any): Redis {
+        const redis = new Redis({
+            host: config.host || 'localhost',
+            port: config.port || 6379,
+            password: config.password,
+            url: config.url,
+            retryStrategy: (times) => {
+                if (times > CONFIG.REDIS_RETRY_ATTEMPTS) return null;
+                return Math.min(times * CONFIG.REDIS_RETRY_DELAY, 3000);
+            }
+        });
+
+        redis.on('error', (error) => {
+            logger.error('Redis connection error:', error);
+            this.handleRedisError(error);
+        });
+
+        return redis;
+    }
+
+    private initializeState(): BotState {
+        return {
+            moodLevel: 0,
+            lastResponses: [],
+            cooldowns: new Map(),
+            conversationHistory: [],
+            personality: PERSONALITY_TRAITS,
+            metrics: {
+                totalInteractions: 0,
+                averageResponseTime: 0,
+                userSatisfactionScore: 0,
+                mostCommonTopics: new Map(),
+                errorRate: 0,
+                activeUsers: new Set()
+            }
+        };
+    }
+
+    private setupCleanup(): void {
+        process.on('SIGINT', async () => {
+            await this.cleanup();
+            process.exit(0);
+        });
+
+        process.on('SIGTERM', async () => {
+            await this.cleanup();
+            process.exit(0);
+        });
+    }
+
+    private async cleanup(): Promise<void> {
+        clearInterval(this.maintenanceInterval);
+        await this.redis.quit();
+        logger.info('RoastBot cleaned up successfully');
+    }
+
+    private async checkRateLimit(userId: string): Promise<boolean> {
+        const now = Date.now();
+        const userRequests = this.rateLimits.get(userId) || [];
+        
+        // Remove old requests outside the window
+        const recentRequests = userRequests.filter(
+            time => now - time < CONFIG.RATE_LIMIT_WINDOW
+        );
+        
+        if (recentRequests.length >= CONFIG.MAX_REQUESTS_PER_MINUTE) {
+            return false;
+        }
+
+        recentRequests.push(now);
+        this.rateLimits.set(userId, recentRequests);
+        return true;
+    }
+
+    private async analyzeMessage(message: Message): Promise<NLPAnalysis> {
+        try {
+            const completion = await this.openai.chat.completions.create({
+                messages: [{
+                    role: 'system',
+                    content: 'Analyze the following message for sentiment, technical complexity, and code presence. Return JSON.'
+                }, {
+                    role: 'user',
+                    content: message.content
+                }],
+                model: CONFIG.DEFAULT_OPENAI_MODEL
+            });
+
+            const analysis = JSON.parse(completion.choices[0].message.content || '{}');
+            
+            return {
+                sentiment: analysis.sentiment || 0,
+                topics: analysis.topics || [],
+                intent: analysis.intent || 'unknown',
+                entities: analysis.entities || [],
+                technicalComplexity: analysis.technicalComplexity || 0,
+                codeDetected: analysis.codeDetected || false,
+                languagesDetected: analysis.languagesDetected || [],
+                toxicity: analysis.toxicity || 0
+            };
+        } catch (error) {
+            logger.error('Analysis error:', error);
+            return this.getFallbackAnalysis();
+        }
+    }
+
+    private getFallbackAnalysis(): NLPAnalysis {
+        return {
+            sentiment: 0,
+            topics: [],
+            intent: 'unknown',
+            entities: [],
+            technicalComplexity: 0,
+            codeDetected: false,
+            languagesDetected: [],
+            toxicity: 0
+        };
+    }
+
+    private async generateResponse(message: Message, analysis: NLPAnalysis): Promise<string> {
+        const personality = this.selectPersonalityTrait(analysis);
+        const template = this.selectResponseTemplate(personality, analysis);
+        
+        try {
+            const completion = await this.openai.chat.completions.create({
+                messages: [{
+                    role: 'system',
+                    content: `You are a code-roasting bot with a ${personality.name} personality. 
+                             Respond to the user's message using this template: ${template}`
+                }, {
+                    role: 'user',
+                    content: message.content
+                }],
+                model: CONFIG.DEFAULT_OPENAI_MODEL,
+                max_tokens: CONFIG.MAX_TOKENS
+            });
+
+            return this.processResponse(completion.choices[0].message.content || '', message);
+        } catch (error) {
+            logger.error('Response generation error:', error);
+            return this.getFallbackResponse(personality);
+        }
+    }
+
+    private selectPersonalityTrait(analysis: NLPAnalysis): PersonalityTrait {
+        return this.state.personality.find(trait => 
+            (!trait.conditions?.minSentiment || analysis.sentiment >= trait.conditions.minSentiment) &&
+            (!trait.conditions?.maxSentiment || analysis.sentiment <= trait.conditions.maxSentiment)
+        ) || this.state.personality[0];
+    }
+
+    private selectResponseTemplate(trait: PersonalityTrait, analysis: NLPAnalysis): string {
+        const validResponses = trait.responses.filter(response => {
+            // Add any additional filtering logic based on analysis
+            return true;
+        });
+        
+        const randomIndex = Math.floor(Math.random() * validResponses.length);
+        return validResponses[randomIndex];
+    }
+
+    private processResponse(response: string, message: Message): string {
+        return response
+            .replace('{userName}', message.userName)
+            .replace('{topic}', 'coding') // Add more sophisticated topic detection
+            .trim();
+    }
+
+    private getFallbackResponse(personality: PersonalityTrait): string {
+        return personality.responses[0]
+            .replace('{userName}', 'developer')
+            .replace('{topic}', 'coding');
+    }
+
+    public async handleMessage(message: unknown): Promise<string> {
+        try {
+            const validatedMessage = MessageSchema.parse(message);
+            
+            if (!await this.checkRateLimit(validatedMessage.userId)) {
+                return "You're sending messages too quickly. Please wait a moment.";
+            }
+
+            const analysis = await this.analyzeMessage(validatedMessage);
+            const response = await this.generateResponse(validatedMessage, analysis);
+            
+            await this.updateMetrics(validatedMessage, analysis, response);
+            
+            return response;
+
+        } catch (error) {
+            logger.error('Message handling error:', error);
+            return "Error processing message. But hey, at least it's not as bad as using PHP! 😉";
+        }
+    }
+
+    private async updateMetrics(message: Message, analysis: NLPAnalysis, response: string): Promise<void> {
+        this.state.metrics.totalInteractions++;
+        this.state.metrics.activeUsers.add(message.userId);
+        
+        // Update topic frequencies
+        analysis.topics.forEach(topic => {
+            const count = this.state.metrics.mostCommonTopics.get(topic) || 0;
+            this.state.metrics.mostCommonTopics.set(topic, count + 1);
+        });
+
+        await this.redis.hset(`metrics:${Date.now()}`, {
+            userId: message.userId,
+            sentiment: analysis.sentiment,
+            responseLength: response.length
+        });
+    }
+
+    private initializeBackgroundTasks(): void {
+        this.maintenanceInterval = setInterval(
+            () => this.performMaintenance(),
+            CONFIG.MAINTENANCE_INTERVAL
+        );
+    }
+
+    private async performMaintenance(): Promise<void> {
+        try {
+            // Clean up rate limits
+            const now = Date.now();
+            for (const [userId, timestamps] of this.rateLimits.entries()) {
+                const validTimestamps = timestamps.filter(
+                    time => now - time < CONFIG.RATE_LIMIT_WINDOW
+                );
+                if (validTimestamps.length === 0) {
+                    this.rateLimits.delete(userId);
+                } else {
+                    this.rateLimits.set(userId, validTimestamps);
+                }
+            }
+
+            // Aggregate metrics
+            await this.aggregateMetrics();
+
+        } catch (error) {
+            logger.error('Maintenance error:', error);
+        }
+    }
+
+    private async aggregateMetrics(): Promise<void> {
+        // Implement metrics aggregation logic
+        // This would typically involve Redis operations and metric calculations
+    }
+
+    private async handleRedisError(error: Error): Promise<void> {
+        logger.error('Redis error:', error);
+        // Implement retry logic or fallback behavior
+    }
+
+    public async disconnect(): Promise<void> {
+        await this.cleanup();
+    }
+}
+
+// src/index.ts
+import { TwitterApi } from 'twitter-api-v2';
+import { RoastBot } from './roast-bot';
+import { logger } from './logger';
+import * as process from 'process';
+
+if (!process.env.OPENAI_API_KEY) {
+    throw new Error('OPENAI_API_KEY environment variable is required');
+}
+
+const client = new TwitterApi({
+    appKey: process.env.TWITTER_APP_KEY,
+    appSecret: process.env.TWITTER_APP_SECRET,
+    accessToken: process.env.TWITTER_ACCESS_TOKEN,
+    accessSecret: process.env.TWITTER_ACCESS_SECRET,
+});
+
+const roastBot = new RoastBot(process.env.OPENAI_API_KEY, {
+    url: process.env.REDIS_URL,
+    password: process.env.REDIS_PASSWORD
+});
+
+async function startBot() {
+    try {
+        const rules = await client.v2.streamRules();
+        if (rules.data?.length) {
+            await client.v2.updateStreamRules({
+                delete: { ids: rules.data.map(rule => rule.id) },
+            });
+        }
+
+        await client.v2.updateStreamRules({
+            add: [{ value: process.env.TWITTER_BOT_USERNAME }],
+        });
+
+        const stream = await client.v2.searchStream({
+            'tweet.fields': ['referenced_tweets', 'author_id'],
+            'user.fields': ['username'],
+        });
+
+        stream.on('data', async tweet => {
+            try {
+                const message = {
+                    content: tweet.data.text,
