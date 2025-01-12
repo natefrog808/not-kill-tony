@@ -4,45 +4,118 @@ export const CONFIG = {
     MAX_MOOD_LEVEL: 10,
     MIN_MOOD_LEVEL: -10,
     MAX_REQUESTS_PER_MINUTE: 50,
-    MAX_MESSAGE_HISTORY: 10,
+    MAX_MESSAGE_HISTORY: 100,
     REDIS_RETRY_ATTEMPTS: 3,
     REDIS_RETRY_DELAY: 1000,
     DEFAULT_OPENAI_MODEL: 'gpt-4',
-    MAX_TOKENS: 150
+    MAX_TOKENS: 150,
+    CONTEXT_WINDOW_SIZE: 10,
+    USER_PROFILE_EXPIRY: 86400 * 30, // 30 days
+    MAINTENANCE_INTERVAL: 3600000, // 1 hour
+    PERSONALITY_ADJUSTMENT_INTERVAL: 900000, // 15 minutes
+    METRICS_AGGREGATION_INTERVAL: 86400000, // 1 day
+    DEFAULT_SENSITIVITY_LEVEL: 0.5,
+    MIN_RESPONSE_TEMPERATURE: 0.3,
+    MAX_RESPONSE_TEMPERATURE: 1.0,
+    BASE_RESPONSE_TEMPERATURE: 0.7
 };
 
 // types.ts
 import { z } from 'zod';
 
 export const MessageSchema = z.object({
-    content: z.string().min(1).max(1000),
+    content: z.string().min(1).max(2000),
     userId: z.string(),
     userName: z.string(),
-    mentions: z.array(z.string()).optional()
+    mentions: z.array(z.string()).optional(),
+    timestamp: z.number().default(() => Date.now())
 });
 
 export type Message = z.infer<typeof MessageSchema>;
 
-export interface BotState {
-    moodLevel: number;
-    lastResponses: string[];
-    cooldowns: Map<string, number>;
-    conversationHistory: string[];
+export interface UserProfile {
+    userId: string;
+    userName: string;
+    sensitivityLevel: number;
+    pastInteractions: InteractionHistory[];
+    preferredTopics: string[];
+    lastInteraction: number;
+    totalInteractions: number;
+    averageSentiment: number;
+    responsePreferences: {
+        witLevel: number;
+        sarcasmLevel: number;
+        technicalLevel: number;
+    };
 }
 
-export interface Memory {
-    shortTerm: string[];
-    longTerm: Map<string, number>;
-    context: string[];
+export interface InteractionHistory {
+    timestamp: number;
+    sentiment: number;
+    responseType: string;
+    messageContent: string;
+    botResponse: string;
+}
+
+export interface ConversationContext {
+    timestamp: number;
+    content: string;
+    sentiment: number;
+    userId: string;
+    messageType: 'user' | 'bot';
+}
+
+export interface AdaptiveParameters {
+    witLevel: number;
+    sarcasmLevel: number;
+    kindnessThreshold: number;
+    technicalLevel: number;
+}
+
+export interface NLPAnalysis {
+    sentiment: number;
+    topics: string[];
+    intent: string;
+    entities: string[];
+    technicalComplexity: number;
+    codeDetected: boolean;
+    languagesDetected: string[];
+    toxicity: number;
 }
 
 export interface PersonalityTrait {
     name: string;
     level: number;
     responses: string[];
+    conditions: {
+        minSentiment?: number;
+        maxSentiment?: number;
+        timeOfDay?: number[];
+        userSensitivity?: number;
+    };
 }
 
-export interface EnhancedBotState extends BotState {
+export interface BotMetrics {
+    totalInteractions: number;
+    averageResponseTime: number;
+    userSatisfactionScore: number;
+    mostCommonTopics: Map<string, number>;
+    errorRate: number;
+    activeUsers: Set<string>;
+}
+
+export interface Memory {
+    shortTerm: ConversationContext[];
+    longTerm: Map<string, number>;
+    context: string[];
+    userInteractions: Map<string, InteractionHistory[]>;
+}
+
+export interface EnhancedBotState {
+    moodLevel: number;
+    lastResponses: string[];
+    cooldowns: Map<string, number>;
+    conversationHistory: ConversationContext[];
     memory: Memory;
     personality: PersonalityTrait[];
     learningRate: number;
@@ -53,35 +126,8 @@ export interface EnhancedBotState extends BotState {
         model: string;
         maxTokens: number;
     };
-}
-
-export interface NLPAnalysis {
-    sentiment: number;
-    topics: string[];
-    intent: string;
-    entities: string[];
-}
-
-// logger.ts
-import winston from 'winston';
-import * as process from 'process';
-
-export const logger = winston.createLogger({
-    level: process.env.LOG_LEVEL || 'info',
-    format: winston.format.combine(
-        winston.format.timestamp(),
-        winston.format.json()
-    ),
-    transports: [
-        new winston.transports.File({ filename: 'error.log', level: 'error' }),
-        new winston.transports.File({ filename: 'combined.log' })
-    ]
-});
-
-if (process.env.NODE_ENV !== 'production') {
-    logger.add(new winston.transports.Console({
-        format: winston.format.simple()
-    }));
+    adaptiveParameters: AdaptiveParameters;
+    metrics: BotMetrics;
 }
 
 // personality-traits.ts
@@ -90,35 +136,108 @@ export const PERSONALITY_TRAITS: PersonalityTrait[] = [
         name: 'sarcasm',
         level: 0.8,
         responses: [
-            "Oh wow, {userName}, that's *totally* genius... 🙄",
-            "Brilliant observation, {userName}. Did you figure that out all by yourself?",
-            "Your code is like a modern art masterpiece, {userName}... nobody understands it.",
-            "Have you considered a career in writing comedy? Because your code is hilarious."
-        ]
+            "Oh wow, {userName}, that's *totally* genius... 🙄 {codeComment}",
+            "Brilliant observation, {userName}. Did you figure that out all by yourself? {codeComment}",
+            "Your code is like a modern art masterpiece, {userName}... nobody understands it. {codeComment}",
+            "Have you considered a career in writing comedy? Because your code is hilarious. {codeComment}"
+        ],
+        conditions: {
+            minSentiment: -0.5,
+            maxSentiment: 0.8,
+            userSensitivity: 0.7
+        }
     },
     {
-        name: 'wit',
-        level: 0.7,
+        name: 'technical',
+        level: 0.9,
         responses: [
-            "I'd explain it to you, {userName}, but I'm all out of crayons.",
-            "Your code is like a mystery novel, {userName}... full of bad practices and plot holes.",
-            "If your code was a movie, {userName}, it would win an award for 'Most Confusing Plot'.",
-            "Ah, {userName}, breaking production with style since {year}!"
-        ]
+            "Let me refactor that for you, {userName}. First, we'll need to address the {issue} in your code.",
+            "Interesting approach, {userName}. Have you considered using {betterPattern} instead?",
+            "Your code's complexity is reaching astronomical levels, {userName}. Time for some clean code principles?",
+            "That's an interesting use of {pattern}... if by interesting you mean potentially catastrophic."
+        ],
+        conditions: {
+            minSentiment: -0.2,
+            maxSentiment: 1.0,
+            userSensitivity: 0.4
+        }
+    },
+    {
+        name: 'encouraging',
+        level: 0.6,
+        responses: [
+            "Not bad, {userName}! But let's make it even better by {improvement}",
+            "You're getting there! Just need to tweak {issue} and you'll be golden.",
+            "I see what you're trying to do. Here's a pro tip: {tip}",
+            "Almost perfect! Just one small suggestion: {suggestion}"
+        ],
+        conditions: {
+            minSentiment: 0.3,
+            maxSentiment: 1.0,
+            userSensitivity: 0.8
+        }
     }
 ];
+
+// utils.ts
+export function calculateSentiment(text: string): number {
+    // Simple sentiment analysis implementation
+    const positiveWords = new Set(['good', 'great', 'awesome', 'excellent', 'perfect', 'thanks']);
+    const negativeWords = new Set(['bad', 'terrible', 'awful', 'horrible', 'wrong', 'stupid']);
+    
+    const words = text.toLowerCase().split(/\s+/);
+    let sentiment = 0;
+    
+    words.forEach(word => {
+        if (positiveWords.has(word)) sentiment += 0.2;
+        if (negativeWords.has(word)) sentiment -= 0.2;
+    });
+    
+    return Math.max(Math.min(sentiment, 1), -1);
+}
+
+export function detectTechnicalComplexity(text: string): number {
+    const technicalTerms = new Set([
+        'algorithm', 'function', 'class', 'method', 'api',
+        'database', 'async', 'promise', 'callback', 'interface'
+    ]);
+    
+    const words = text.toLowerCase().split(/\s+/);
+    let complexity = 0;
+    
+    words.forEach(word => {
+        if (technicalTerms.has(word)) complexity += 0.2;
+    });
+    
+    return Math.min(complexity, 1);
+}
+
+export function detectCodeSnippet(text: string): boolean {
+    const codePatterns = [
+        /\b(function|class|const|let|var|if|for|while)\b/,
+        /[{}\[\]()]/,
+        /\b(return|import|export)\b/,
+        /\b(async|await)\b/,
+        /\b(try|catch)\b/
+    ];
+    
+    return codePatterns.some(pattern => pattern.test(text));
+}
 
 // roast-bot.ts
 import { OpenAI } from 'openai';
 import { Redis } from 'ioredis';
 import { CONFIG } from './config';
 import { logger } from './logger';
-import { 
-    Message, 
-    MessageSchema, 
-    EnhancedBotState, 
+import * as utils from './utils';
+import {
+    Message,
+    MessageSchema,
+    EnhancedBotState,
     NLPAnalysis,
-    PersonalityTrait 
+    UserProfile,
+    ConversationContext,
+    PersonalityTrait
 } from './types';
 import { PERSONALITY_TRAITS } from './personality-traits';
 
@@ -126,14 +245,11 @@ export class RoastBot {
     private state: EnhancedBotState;
     private openai: OpenAI;
     private redis: Redis;
-    private requestCount: number = 0;
-    private requestResetTime: number = Date.now();
+    private userProfiles: Map<string, UserProfile> = new Map();
+    private maintenanceInterval: NodeJS.Timeout;
+    private personalityInterval: NodeJS.Timeout;
+    private metricsInterval: NodeJS.Timeout;
 
-    /**
-     * Creates a new instance of RoastBot
-     * @param apiKey - OpenAI API key
-     * @param redisConfig - Redis configuration options
-     */
     constructor(apiKey: string, redisConfig: {
         host?: string;
         port?: number;
@@ -144,72 +260,86 @@ export class RoastBot {
         this.redis = this.initializeRedis(redisConfig);
         this.state = this.initializeState();
         this.setupCleanup();
+        this.initializeBackgroundTasks();
     }
 
-    private initializeRedis(config: any): Redis {
-        const redis = new Redis({
-            host: config.host || 'localhost',
-            port: config.port || 6379,
-            password: config.password,
-            url: config.url,
-            retryStrategy: (times) => {
-                if (times > CONFIG.REDIS_RETRY_ATTEMPTS) return null;
-                return Math.min(times * CONFIG.REDIS_RETRY_DELAY, 3000);
-            }
-        });
+    private async analyzeMessage(message: Message): Promise<NLPAnalysis> {
+        try {
+            const sentiment = utils.calculateSentiment(message.content);
+            const technicalComplexity = utils.detectTechnicalComplexity(message.content);
+            const codeDetected = utils.detectCodeSnippet(message.content);
+            
+            // Use OpenAI for more detailed analysis
+            const completion = await this.openai.chat.completions.create({
+                messages: [{
+                    role: 'system',
+                    content: 'Analyze the following message for topics, intent, and entities. Return JSON.'
+                }, {
+                    role: 'user',
+                    content: message.content
+                }],
+                model: this.state.openAIConfig.model
+            });
 
-        redis.on('error', (error) => {
-            logger.error('Redis connection error:', error);
-            this.handleRedisError(error);
-        });
+            const aiAnalysis = JSON.parse(completion.choices[0].message.content || '{}');
 
-        redis.on('connect', () => {
-            logger.info('Successfully connected to Redis');
-        });
-
-        return redis;
+            return {
+                sentiment,
+                technicalComplexity,
+                codeDetected,
+                topics: aiAnalysis.topics || [],
+                intent: aiAnalysis.intent || 'unknown',
+                entities: aiAnalysis.entities || [],
+                languagesDetected: aiAnalysis.languages || [],
+                toxicity: aiAnalysis.toxicity || 0
+            };
+        } catch (error) {
+            logger.error('Error in message analysis:', error);
+            return {
+                sentiment: 0,
+                topics: [],
+                intent: 'unknown',
+                entities: [],
+                technicalComplexity: 0,
+                codeDetected: false,
+                languagesDetected: [],
+                toxicity: 0
+            };
+        }
     }
 
-    private initializeState(): EnhancedBotState {
-        return {
-            moodLevel: 0,
-            lastResponses: [],
-            cooldowns: new Map(),
-            conversationHistory: [],
-            memory: {
-                shortTerm: [],
-                longTerm: new Map(),
-                context: []
-            },
-            personality: PERSONALITY_TRAITS,
-            learningRate: 0.1,
-            lastInteractionTime: Date.now(),
-            commandPrefix: '!',
-            debugMode: process.env.NODE_ENV !== 'production',
-            openAIConfig: {
-                model: CONFIG.DEFAULT_OPENAI_MODEL,
-                maxTokens: CONFIG.MAX_TOKENS
-            }
-        };
+    private async generateResponse(message: Message, analysis: NLPAnalysis): Promise<string> {
+        try {
+            const userProfile = await this.getUserProfile(message.userId);
+            const personality = this.selectPersonalityTrait(analysis, userProfile);
+            const template = this.selectResponseTemplate(personality, analysis);
+            
+            const prompt = this.buildPrompt(message, analysis, personality, template);
+            
+            const completion = await this.openai.chat.completions.create({
+                messages: [{
+                    role: 'system',
+                    content: prompt
+                }],
+                model: this.state.openAIConfig.model,
+                temperature: this.calculateResponseTemperature(analysis)
+            });
+
+            const response = this.processResponse(
+                completion.choices[0].message.content || '',
+                message,
+                analysis
+            );
+
+            await this.updateUserProfile(message.userId, analysis, response);
+            
+            return response;
+        } catch (error) {
+            logger.error('Error generating response:', error);
+            return "Sorry, I'm having a moment... unlike your code, which seems to be having several moments.";
+        }
     }
 
-    private setupCleanup(): void {
-        process.on('SIGINT', async () => {
-            await this.disconnect();
-            process.exit(0);
-        });
-
-        process.on('SIGTERM', async () => {
-            await this.disconnect();
-            process.exit(0);
-        });
-    }
-
-    /**
-     * Handles incoming messages with validation and rate limiting
-     * @param message - The incoming message
-     * @returns Promise<string> - Bot's response
-     */
     public async handleMessage(message: unknown): Promise<string> {
         try {
             const validatedMessage = MessageSchema.parse(message);
@@ -218,77 +348,84 @@ export class RoastBot {
                 return "You're sending messages too quickly. Please wait a moment.";
             }
 
-            if (this.isUserInCooldown(validatedMessage.userId)) {
-                return null;
-            }
-
-            logger.info('Processing message', {
-                userId: validatedMessage.userId,
-                messageLength: validatedMessage.content.length
-            });
-
-            if (validatedMessage.content.startsWith(this.state.commandPrefix)) {
-                return this.handleCommand(validatedMessage);
-            }
-
-            const analysis = await this.analyzeMessage(validatedMessage.content);
-            this.updateState(validatedMessage, analysis);
+            const analysis = await this.analyzeMessage(validatedMessage);
             const response = await this.generateResponse(validatedMessage, analysis);
             
-            this.setCooldown(validatedMessage.userId);
-            await this.updateHistory(validatedMessage.userId, {
-                input: validatedMessage.content,
-                response
-            });
-
+            await this.updateMetrics(validatedMessage, analysis, response);
+            
             return response;
-
         } catch (error) {
-            logger.error('Error processing message:', error);
-            if (error instanceof z.ZodError) {
-                return 'Invalid message format';
-            }
-            return 'An error occurred while processing your message';
+            logger.error('Error handling message:', error);
+            return "Something went wrong. But hey, at least it's not as wrong as using tabs instead of spaces!";
         }
     }
 
-    private async checkRateLimit(userId: string): Promise<boolean> {
-        const key = `ratelimit:${userId}`;
-        const count = await this.incrementCounter(key);
-        return count <= CONFIG.MAX_REQUESTS_PER_MINUTE;
-    }
-
-    private async handleRedisError(error: Error): Promise<void> {
-        logger.error('Redis error:', error);
-        for (let i = 0; i < CONFIG.REDIS_RETRY_ATTEMPTS; i++) {
-            try {
-                await this.redis.ping();
-                logger.info('Redis reconnection successful');
-                return;
-            } catch (e) {
-                logger.error(`Redis reconnection attempt ${i + 1} failed:`, e);
-                await new Promise(resolve => 
-                    setTimeout(resolve, CONFIG.REDIS_RETRY_DELAY * (i + 1))
-                );
-            }
-        }
-        logger.error('Redis reconnection failed after all attempts');
-    }
-
-    // ... Additional methods (analyzeMessage, generateResponse, etc.)
-    // would follow the same pattern of strong typing, error handling,
-    // and logging. Removed for brevity but can be expanded if needed.
-
-    /**
-     * Cleanly disconnects from Redis and performs cleanup
-     */
-    public async disconnect(): Promise<void> {
+    private async getUserProfile(userId: string): Promise<UserProfile> {
         try {
-            await this.redis.quit();
-            logger.info('Bot disconnected successfully');
+            const cachedProfile = this.userProfiles.get(userId);
+            if (cachedProfile) return cachedProfile;
+
+            const storedProfile = await this.redis.get(`user:${userId}`);
+            if (storedProfile) {
+                const profile = JSON.parse(storedProfile);
+                this.userProfiles.set(userId, profile);
+                return profile;
+            }
+
+            return this.createNewUserProfile(userId);
         } catch (error) {
-            logger.error('Error during disconnect:', error);
+            logger.error('Error getting user profile:', error);
+            return this.createNewUserProfile(userId);
         }
+    }
+
+    private createNewUserProfile(userId: string): UserProfile {
+        const profile: UserProfile = {
+            userId,
+            userName: '',
+            sensitivityLevel: CONFIG.DEFAULT_SENSITIVITY_LEVEL,
+            pastInteractions: [],
+            preferredTopics: [],
+            lastInteraction: Date.now(),
+            totalInteractions: 0,
+            averageSentiment: 0,
+            responsePreferences: {
+                witLevel: 0.5,
+                sarcasmLevel: 0.5,
+                technicalLevel: 0.5
+            }
+        };
+
+        this.userProfiles.set(userId, profile);
+        this.redis.set(`user:${userId}`, JSON.stringify(profile), 'EX', CONFIG.USER_PROFILE_EXPIRY);
+        
+        return profile;
+    }
+
+    private initializeBackgroundTasks(): void {
+        this.maintenanceInterval = setInterval(
+            () => this.performMaintenance(),
+            CONFIG.MAINTENANCE_INTERVAL
+        );
+        
+        this.personalityInterval = setInterval(
+            () => this.adjustPersonality(),
+            CONFIG.PERSONALITY_ADJUSTMENT_INTERVAL
+        );
+        
+        this.metricsInterval = setInterval(
+            () => this.aggregateMetrics(),
+            CONFIG.METRICS_AGGREGATION_INTERVAL
+        );
+    }
+
+    public async disconnect(): Promise<void> {
+        clearInterval(this.maintenanceInterval);
+        clearInterval(this.personalityInterval);
+        clearInterval(this.metricsInterval);
+        
+        await this.redis.quit();
+        logger.info('RoastBot disconnected successfully');
     }
 }
 
@@ -306,108 +443,4 @@ const client = new TwitterApi({
     appKey: process.env.TWITTER_APP_KEY,
     appSecret: process.env.TWITTER_APP_SECRET,
     accessToken: process.env.TWITTER_ACCESS_TOKEN,
-    accessSecret: process.env.TWITTER_ACCESS_SECRET,
-});
-
-const roastBot = new RoastBot(process.env.OPENAI_API_KEY, {
-    url: process.env.REDIS_URL,
-    password: process.env.REDIS_PASSWORD
-});
-
-async function startBot() {
-    try {
-        const rules = await client.v2.streamRules();
-        if (rules.data?.length) {
-            await client.v2.updateStreamRules({
-                delete: { ids: rules.data.map(rule => rule.id) },
-            });
-        }
-
-        await client.v2.updateStreamRules({
-            add: [{ value: process.env.TWITTER_BOT_USERNAME }],
-        });
-
-        const stream = await client.v2.searchStream({
-            'tweet.fields': ['referenced_tweets', 'author_id'],
-            'user.fields': ['username'],
-        });
-
-        stream.on('data', async tweet => {
-            try {
-                const message = {
-                    content: tweet.data.text,
-                    userId: tweet.data.author_id,
-                    userName: tweet.includes?.users?.[0]?.username || '',
-                    mentions: tweet.entities?.mentions?.map(m => m.username) || []
-                };
-
-                const response = await roastBot.handleMessage(message);
-                if (response) {
-                    await client.v2.reply(response, tweet.data.id);
-                }
-            } catch (error) {
-                logger.error('Error processing tweet:', error);
-            }
-        });
-
-        stream.on('error', error => {
-            logger.error('Stream error:', error);
-        });
-
-    } catch (error) {
-        logger.error('Bot startup error:', error);
-        process.exit(1);
-    }
-}
-
-startBot();
-
-// test/roast-bot.test.ts
-import { describe, it, expect, beforeEach, afterEach, jest } from '@jest/globals';
-import { RoastBot } from '../src/roast-bot';
-import { Redis } from 'ioredis';
-import { OpenAI } from 'openai';
-
-jest.mock('ioredis');
-jest.mock('openai');
-
-describe('RoastBot', () => {
-    let bot: RoastBot;
-    
-    beforeEach(() => {
-        bot = new RoastBot('fake-api-key');
-    });
-
-    afterEach(async () => {
-        await bot.disconnect();
-    });
-
-    it('should handle valid messages', async () => {
-        const message = {
-            content: 'Hello bot',
-            userId: 'user123',
-            userName: 'testUser'
-        };
-
-        const response = await bot.handleMessage(message);
-        expect(response).toBeTruthy();
-    });
-
-    it('should respect rate limits', async () => {
-        const message = {
-            content: 'Test message',
-            userId: 'user123',
-            userName: 'testUser'
-        };
-
-        // Send multiple messages quickly
-        const responses = await Promise.all(
-            Array(6).fill(null).map(() => bot.handleMessage(message))
-        );
-
-        const rateLimited = responses.some(r => 
-            r?.includes('sending messages too quickly')
-        );
-        expect(rateLimited).toBe(true);
-    });
-});
+    accessSecret: process.env.TWITTER
