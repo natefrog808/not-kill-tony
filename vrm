@@ -1,0 +1,63 @@
+import { VRMUtils, VRMSchema } from '@pixiv/three-vrm';
+
+const createVRMAvatar = async () => {
+  const avatarConfig = {
+    specVersion: '0.0',
+    meta: {
+      name: 'AI Agent Avatar',
+      version: '1.0',
+      authors: ['Your Name'],
+      exporterVersion: 'Hyperfy VRM Exporter',
+      contactInformation: '',
+      references: '',
+      allowedUserName: VRMSchema.UserName.Everyone,
+      violentUsageName: VRMSchema.ViolentUsage.Disallow,
+      sexualUsageName: VRMSchema.SexualUsage.Disallow,
+      commercialUsageName: VRMSchema.CommercialUsage.Allow
+    },
+    humanoid: {
+      humanBones: [
+        { bone: 'hips', node: 0 },
+        { bone: 'spine', node: 1 },
+        { bone: 'chest', node: 2 },
+        { bone: 'neck', node: 3 },
+        { bone: 'head', node: 4 },
+      ]
+    },
+    expressions: {
+      preset: {
+        happy: { isBinary: true, overrides: {} },
+        angry: { isBinary: true, overrides: {} },
+        sad: { isBinary: true, overrides: {} }
+      }
+    },
+  };
+
+  return avatarConfig;
+};
+
+// Recommended Next Steps
+const implementationSteps = [
+  {
+    step: 'Design 3D Model',
+    details: 'Create avatar geometry in Blender or Maya. Ensure topology supports smooth deformations.'
+  },
+  {
+    step: 'Bone Rigging',
+    details: 'Precisely map humanoid bones. Use VRM standard bone naming conventions.'
+  },
+  {
+    step: 'Texture Mapping',
+    details: 'Create and apply textures. Optimize for performance in Hyperfy v2.'
+  },
+  {
+    step: 'VRM Export',
+    details: 'Use Blender VRM plugin or Unity VRM SDK to export final .vrm file.'
+  },
+  {
+    step: 'Hyperfy v2 Integration',
+    details: 'Upload VRM to Hyperfy, verify avatar animations and interactions.'
+  }
+];
+
+export { createVRMAvatar, implementationSteps };
